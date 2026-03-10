@@ -1,25 +1,5 @@
 ### Share your internet connection with other devices, using an Ethernet cable
-
-```
-INTERNET
-    |
-    |
-    V
-WiFi Router
-    |
-    |
-    V
-Main device (can use the Internet normally)
-    |
-    |
-    V
-This script
-    |
-    |
-    V                        .----> Downstream device 1 (can use the Internet normally)
-Main device's Ethernet port(s) ---> Downstream device 2 (can use the Internet normally)
-                             `----> Downstream device 3 (can use the Internet normally)
-```
+<img width="2543" height="1083" alt="eth-hotspot-diagram" src="https://github.com/user-attachments/assets/5cfd1836-6cd1-4d85-8f89-b5c4e092dfde" />
 
 This is useful for when you only have one WiFi adapter, but you want multiple devices to use that one internet connection, without buying any additional hardware.  
 With this script, I'm using a Raspberry Pi's built-in ethernet port to share its internet connection to other downstream devices.
