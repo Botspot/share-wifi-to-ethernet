@@ -72,7 +72,7 @@ else
   if [ ! -z "$UPSTREAM_DEV" ];then
     echo "Warning: Ignoring your pre-selected upstream network interface ($UPSTREAM_DEV) because it does not appear on this list: $options"
   fi
-  userinput_func "Choose a network interface to share" $options
+  userinput_func "Choose a network interface to share" $options || error "Failed to launch GUI to select upstream network interface!\nYour options are: '$options'\nPlease specity one as the first argument to this script."
   UPSTREAM_DEV="$output"
 fi
 
@@ -91,7 +91,7 @@ else
   if [ ! -z "$DOWNSTREAM_DEV" ];then
     echo "Warning: Ignoring your pre-selected downstream network interface ($DOWNSTREAM_DEV) because it does not appear on this list: $options"
   fi
-  userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options
+  userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options || error "Failed to launch GUI to select downstream network interface!\nYour options are: '$options'\nPlease specity one as the second argument to this script."
   DOWNSTREAM_DEV="$output"
 fi
 
