@@ -56,9 +56,23 @@ elif ! command -v yad >/dev/null || ! command -v dnsmasq >/dev/null || ! command
   error "Please install the dependencies: yad dnsmasq tcpdump"
 fi
 
-userinput_func "Choose a network interface to share" $(ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+#Choose a network interface to share
+options="$(ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u)"
+if [ -z "$options" ];then
+  error "Could not find any default network device that the kernel considers 'default'!"
+else
+  options="$(echo "$options" | tr '\n' ' ')"
+fi
+userinput_func "Choose a network interface to share" $options
 UPSTREAM_DEV="$output"
-userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $(for dev in /sys/class/net/*; do [ -e "$dev/device" ] && [ ! -d "$dev/wireless" ] && echo "${dev##*/}"; done)
+
+options="$(for dev in /sys/class/net/*; do [ -e "$dev/device" ] && [ ! -d "$dev/wireless" ] && echo "${dev##*/}"; done | grep -vFx "$UPSTREAM_DEV")"
+if [ -z "$options" ];then
+  error "Could not find any ethernet network devices to share a connection to!"
+else
+  options="$(echo "$options" | tr '\n' ' ')"
+fi
+userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options
 DOWNSTREAM_DEV="$output"
 
 echo "upstream $UPSTREAM_DEV"
@@ -72,7 +86,6 @@ cleanup() {
     kill $(cat /var/run/ns_dnsmasq.pid) 2>/dev/null
     rm -f /var/run/ns_dnsmasq.pid
   fi
-  killall tcpdump 2>/dev/null
 
   # 2. Obliterate the namespace. This automatically cleans up the macvlan interface inside it.
   echo "[+] Removing network namespace 'dhcp_ns'..."
