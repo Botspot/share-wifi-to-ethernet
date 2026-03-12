@@ -48,6 +48,11 @@ userinput_func() { # userinput function to display yad/cli prompts to the user
   output=$(yad "${yadflags[@]}" --no-escape --undecorated --center --borders=20 \
     --text="$text" --form --no-buttons --fixed \
     "${uniq_selection[@]}")
+  if [ -z "$output" ];then
+    return 1
+  else
+    return 0
+  fi
 }
 
 if [ "$EUID" -ne 0 ]; then
