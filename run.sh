@@ -12,6 +12,7 @@
 #    a lightweight `dnsmasq` instance its own clean port 67 to answer downstream requests.
 # 2. We bypass buggy third-party ARP daemons (like `parprouted`) by configuring native
 #    Linux kernel Proxy ARP and routing a tiny sliver of IPs (/28) directly to eth0.
+# 3. We test if the upstream Wi-Fi AP allows spoofed IPs, and automatically apply NAT if it doesn't.
 
 # --- Error Handling ---
 # Prints red text and exits immediately if a critical command fails.
@@ -57,8 +58,8 @@ userinput_func() { # userinput function to display yad/cli prompts to the user
 
 if [ "$EUID" -ne 0 ]; then
   error "Script must be run as root (use sudo)"
-elif ! command -v yad >/dev/null || ! command -v dnsmasq >/dev/null || ! command -v tcpdump >/dev/null ;then
-  error "Please install the dependencies: yad dnsmasq tcpdump"
+elif ! command -v yad >/dev/null || ! command -v dnsmasq >/dev/null || ! command -v tcpdump >/dev/null || ! command -v iptables >/dev/null ;then
+  error "Please install the dependencies: yad dnsmasq tcpdump iptables"
 fi
 
 #Choose a network interface to share
@@ -116,8 +117,9 @@ cleanup() {
   echo "[+] Removing network namespace 'dhcp_ns'..."
   ip netns del dhcp_ns 2>/dev/null
 
-  # 3. Revert kernel routing and proxy ARP sysctl flags to prevent unwanted network leakage later.
-  echo "[+] Reverting IP routing and proxy ARP kernel flags..."
+  # 3. Revert NAT and kernel routing flags to prevent unwanted network leakage later.
+  echo "[+] Reverting IP routing, NAT rules, and proxy ARP kernel flags..."
+  iptables -t nat -D POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE 2>/dev/null
   sysctl -w net.ipv4.ip_forward=0 > /dev/null
   sysctl -w net.ipv4.conf.all.proxy_arp=0 > /dev/null
   sysctl -w net.ipv4.conf.$UPSTREAM_DEV.proxy_arp=0 > /dev/null
@@ -143,26 +145,18 @@ echo "[+] Starting Wi-Fi to Ethernet Pseudobridge with Isolated DHCP..."
 
 # Pre-cleanup in case a previous run crashed or was forcefully killed (SIGKILL).
 ip netns del dhcp_ns 2>/dev/null
+iptables -t nat -D POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE 2>/dev/null
 
 # Disconnect NetworkManager from eth0. If we don't do this, NM will detect the link
 # state change when a device is plugged in, wipe our manual IPs, and try to request its own.
 echo "[+] Setting $DOWNSTREAM_DEV to unmanaged state in NetworkManager..."
 nmcli device set $DOWNSTREAM_DEV managed no || error "Failed to release $DOWNSTREAM_DEV from NetworkManager"
 
-# Enable kernel-level forwarding and Native Proxy ARP. This allows the Pi to seamlessly
-# answer ARP requests on wlan1 on behalf of the downstream devices on eth0.
-echo "[+] Enabling IP forwarding and Native Proxy ARP..."
-sysctl -w net.ipv4.ip_forward=1 > /dev/null || error "Failed to enable ip_forward"
-sysctl -w net.ipv4.conf.all.proxy_arp=1 > /dev/null || error "Failed to set global proxy_arp"
-sysctl -w net.ipv4.conf.$UPSTREAM_DEV.proxy_arp=1 > /dev/null || error "Failed to set $UPSTREAM_DEV proxy_arp"
-sysctl -w net.ipv4.conf.$DOWNSTREAM_DEV.proxy_arp=1 > /dev/null || error "Failed to set $DOWNSTREAM_DEV proxy_arp"
-
 echo "[+] Bringing up $DOWNSTREAM_DEV physical link..."
 ip link set $DOWNSTREAM_DEV up || error "Failed to bring up $DOWNSTREAM_DEV"
 ip addr flush dev $DOWNSTREAM_DEV || error "Failed to flush $DOWNSTREAM_DEV addresses"
 
 # --- Dynamic Subnet & Pool Calculation ---
-# Dynamically pull the active Wi-Fi IP. This allows the script to be portable across different Wi-Fi networks.
 UPSTREAM_DEV_CIDR=$(ip -4 addr show $UPSTREAM_DEV | awk '/inet / {print $2}' | head -n 1)
 if [ -z "$UPSTREAM_DEV_CIDR" ]; then
     error "Could not find an IPv4 address for $UPSTREAM_DEV. Ensure you are connected to Wi-Fi."
@@ -172,23 +166,51 @@ SUBNET=$(echo $UPSTREAM_DEV_IP | cut -d. -f1-3)
 ROUTER_IP=$(ip route show default | awk '/default/ {print $3}' | head -n 1)
 
 # Define a /28 subnet at the very top of the range (covers .240 to .255).
-# This avoids DHCP pool collisions with the main upstream router.
 DHCP_SUBNET="${SUBNET}.240/28"
 DHCP_START="${SUBNET}.241"
 DHCP_END="${SUBNET}.249"
-DHCP_NS_IP="${SUBNET}.250" # The IP the namespace DHCP server will use to communicate.
+DHCP_NS_IP="${SUBNET}.250" 
 
 echo "[+] Main Router Gateway detected: $ROUTER_IP"
 echo "[+] Reserving isolated DHCP pool for downstream: $DHCP_START - $DHCP_END"
 
-# --- Host Routing Configuration ---
-# The Linux kernel requires an interface to have an IP address before it will route traffic to it.
-# We clone the Wi-Fi IP as a /32 (single host) to satisfy the kernel without causing subnet conflicts.
+
+# --- AP Strictness Auto-Detection ---
+echo "[+] Testing if Wi-Fi Access Point enforces strict Layer-2 MAC/IP matching..."
+# We must run this test ON the upstream Wi-Fi interface BEFORE injecting downstream static routes, 
+# otherwise Linux's internal routing table or rp_filter will kill the test packet locally, causing a false positive.
+ip addr add $DHCP_END/32 dev $UPSTREAM_DEV
+
+# Attempt to ping the router using the spoofed downstream IP. We capture output for debugging.
+if PING_OUT=$(ping -I $DHCP_END -c 2 -W 2 $ROUTER_IP 2>&1); then
+    echo "[+] SUCCESS: Permissive Wi-Fi AP detected. Bypassing NAT for direct downstream access!"
+    USE_NAT=0
+else
+    echo "[!] WARNING: Spoof test failed. The Wi-Fi AP likely dropped the packet."
+    echo "[!] DEBUG OUTPUT: $PING_OUT"
+    echo "[!] Applying NAT (Masquerade) rule as a fallback."
+    USE_NAT=1
+fi
+
+# Clean up the temporary test IP
+ip addr del $DHCP_END/32 dev $UPSTREAM_DEV
+
+# Apply NAT if the test failed
+if [ "$USE_NAT" -eq 1 ]; then
+    iptables -t nat -A POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE || error "Failed to apply iptables NAT masquerade rule"
+fi
+
+
+# --- Host Routing & Proxy ARP Configuration ---
+echo "[+] Enabling IP forwarding and Proxy ARP..."
+sysctl -w net.ipv4.ip_forward=1 > /dev/null || error "Failed to enable ip_forward"
+sysctl -w net.ipv4.conf.all.proxy_arp=1 > /dev/null || error "Failed to set global proxy_arp"
+sysctl -w net.ipv4.conf.$UPSTREAM_DEV.proxy_arp=1 > /dev/null || error "Failed to set $UPSTREAM_DEV proxy_arp"
+sysctl -w net.ipv4.conf.$DOWNSTREAM_DEV.proxy_arp=1 > /dev/null || error "Failed to set $DOWNSTREAM_DEV proxy_arp"
+
 echo "[+] Cloning Wi-Fi IP ($UPSTREAM_DEV_IP) to $DOWNSTREAM_DEV to satisfy kernel routing..."
 ip addr add $UPSTREAM_DEV_IP/32 dev $DOWNSTREAM_DEV || error "Failed to clone IP to $DOWNSTREAM_DEV"
 
-# We tell the kernel that our highly specific /28 block lives exclusively out the eth0 interface.
-# Without this, Proxy ARP won't know which packets to intercept and bridge.
 echo "[+] Injecting static route for downstream pool ($DHCP_SUBNET) to $DOWNSTREAM_DEV..."
 ip route add $DHCP_SUBNET dev $DOWNSTREAM_DEV || error "Failed to add static route for downstream pool"
 
@@ -196,8 +218,6 @@ ip route add $DHCP_SUBNET dev $DOWNSTREAM_DEV || error "Failed to add static rou
 echo "[+] Creating isolated network namespace 'dhcp_ns'..."
 ip netns add dhcp_ns || error "Failed to create network namespace"
 
-# Create a macvlan bridge. This creates a virtual network interface that shares the
-# physical eth0 hardware but operates independently, allowing us to drop it into the namespace.
 echo "[+] Spinning up macvlan interface on $DOWNSTREAM_DEV and binding to namespace..."
 ip link add link $DOWNSTREAM_DEV name eth0_dhcp type macvlan mode bridge || error "Failed to create macvlan interface"
 ip link set eth0_dhcp netns dhcp_ns || error "Failed to move macvlan to namespace"
@@ -207,8 +227,6 @@ ip netns exec dhcp_ns ip link set lo up || error "Failed to bring up loopback in
 ip netns exec dhcp_ns ip link set eth0_dhcp up || error "Failed to bring up macvlan in namespace"
 ip netns exec dhcp_ns ip addr add ${DHCP_NS_IP}/24 dev eth0_dhcp || error "Failed to assign IP to macvlan"
 
-# Launch dnsmasq entirely inside the isolated namespace.
-# Because it's isolated, it will successfully bind to port 67 on eth0_dhcp without hitting the Waydroid lock.
 echo "[+] Launching isolated dnsmasq DHCP server..."
 ip netns exec dhcp_ns /usr/sbin/dnsmasq \
   --conf-file=/dev/null \
@@ -226,4 +244,4 @@ echo "[!] Awaiting downstream connection. Expected IP allocation: ~$DHCP_START"
 echo "[==================================================]"
 
 # Monitor and output DHCP (UDP 67/68) and ARP traffic in real-time.
-tcpdump -i any "(udp and (port 67 or port 68))" -n || error "Failed to start tcpdump monitoring"
+tcpdump -i any "(udp and (port 67 or port 68)) or arp" -n || error "Failed to start tcpdump monitoring"
